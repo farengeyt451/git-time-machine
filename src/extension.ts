@@ -30,6 +30,10 @@ interface Session {
   relPath: string;
   timeline: CommitInfo[];
   position: number;
+  /** Newest commit that touched the file (real HEAD for this path), if any. */
+  head: CommitInfo | undefined;
+  /** True when the working file differs from HEAD (staged or unstaged). */
+  dirty: boolean;
 }
 
 const sessions = new Map<string, Session>();
@@ -123,48 +127,106 @@ async function ensureSession(fileFsPath: string): Promise<Session | undefined> {
   // If the working tree matches HEAD, the newest commit is identical to the file on
   // disk, so drop it; otherwise the working file is itself a distinct "newest" state
   // and we keep every commit (the first `prev` shows the uncommitted changes).
+  const head = commits[0];
   let timeline = commits;
+  let dirty = false;
   if (commits.length > 0) {
-    const dirty = await hasUncommittedChanges(root, relPath);
+    dirty = await hasUncommittedChanges(root, relPath);
     if (!dirty) {
       timeline = commits.slice(1);
     }
   }
 
-  const session: Session = { fileFsPath, repoRoot: root, relPath, timeline, position: 0 };
+  const session: Session = { fileFsPath, repoRoot: root, relPath, timeline, position: 0, head, dirty };
 
   sessions.set(fileFsPath, session);
 
   return session;
 }
 
-function setContext(enabled: boolean, canPrev: boolean, canCurrent: boolean, canNext: boolean): void {
+let statusBarItem: vscode.StatusBarItem | undefined;
+
+function setContext(enabled: boolean, canPrev: boolean, canNext: boolean): void {
   void vscode.commands.executeCommand('setContext', 'gtm:enabled', enabled);
   void vscode.commands.executeCommand('setContext', 'gtm:canPrev', canPrev);
-  void vscode.commands.executeCommand('setContext', 'gtm:canCurrent', canCurrent);
   void vscode.commands.executeCommand('setContext', 'gtm:canNext', canNext);
+}
+
+/** How many commits back from HEAD the given position lands on. */
+function commitsBehindHead(session: Session, position: number): number {
+  if (position === 0) {
+    return 0;
+  }
+  // With a dirty tree the whole history is kept, so timeline[0] is HEAD itself
+  // (position 1 == 0 behind); with a clean tree HEAD was dropped, so position 1
+  // is already one commit behind.
+  return session.dirty ? position - 1 : position;
+}
+
+/** Short human summary of where the session currently sits, e.g. "3 behind HEAD (3/12)". */
+function positionLabel(session: Session): string {
+  if (session.position === 0) {
+    return session.dirty ? 'Working tree (uncommitted)' : 'At HEAD';
+  }
+  const behind = commitsBehindHead(session, session.position);
+  const where = behind === 0 ? 'At HEAD' : `${behind} behind HEAD`;
+  return `${where} (${session.position}/${session.timeline.length})`;
+}
+
+/** Compact unicode timeline: ○ per revision, ◉ marks the current position (newest on the left). */
+function timelineStrip(session: Session): string {
+  const total = session.timeline.length;
+  if (total === 0) {
+    return '';
+  }
+  if (total > 25) {
+    return `◉ ${session.position}/${total}`;
+  }
+  const dots: string[] = [];
+  for (let p = 0; p <= total; p++) {
+    dots.push(p === session.position ? '◉' : '○');
+  }
+  return dots.join('─');
+}
+
+function updateStatusBar(session: Session | undefined): void {
+  if (!statusBarItem) {
+    return;
+  }
+  if (!session) {
+    statusBarItem.hide();
+    return;
+  }
+  statusBarItem.text = `$(history) ${positionLabel(session)}`;
+  const tip = new vscode.MarkdownString(undefined, true);
+  tip.appendMarkdown('**Git Time Machine**\n\n');
+  if (session.head) {
+    tip.appendMarkdown(`HEAD → \`${session.head.sha}\`\n\n`);
+  }
+  if (session.position > 0) {
+    const commit = session.timeline[session.position - 1];
+    tip.appendMarkdown(`CURRENT → \`${commit.sha}\`\n\n`);
+  }
+  tip.appendMarkdown('Click to browse this file\u2019s history.');
+  statusBarItem.tooltip = tip;
+  statusBarItem.show();
 }
 
 async function updateContext(): Promise<void> {
   const fileFsPath = activeFilePath();
-
-  if (!fileFsPath) {
-    setContext(false, false, false, false);
-    return;
-  }
-
-  const session = await ensureSession(fileFsPath);
+  const session = fileFsPath ? await ensureSession(fileFsPath) : undefined;
 
   if (!session) {
-    setContext(false, false, false, false);
+    setContext(false, false, false);
+    updateStatusBar(undefined);
     return;
   }
 
   const canPrev = session.position < session.timeline.length;
-  const canCurrent = session.position > 0;
   const canNext = session.position > 0;
 
-  setContext(true, canPrev, canCurrent, canNext);
+  setContext(true, canPrev, canNext);
+  updateStatusBar(session);
 }
 
 /** Opens the editor view that matches the session's current position. */
@@ -183,6 +245,27 @@ async function showView(session: Session): Promise<void> {
   await vscode.commands.executeCommand('vscode.diff', left, fileUri, title, { preview: true });
 }
 
+/**
+ * True while we are programmatically swapping the editor view. Opening a new
+ * revision diff replaces (and thus "closes") the previous one, which we must
+ * NOT mistake for the user closing the diff — otherwise the position would be
+ * reset mid-navigation. Cleared on the next macrotask so any tab events emitted
+ * by the open have already been handled.
+ */
+let navigating = false;
+
+async function renderSession(session: Session): Promise<void> {
+  navigating = true;
+  try {
+    await showView(session);
+    await updateContext();
+  } finally {
+    setTimeout(() => {
+      navigating = false;
+    }, 0);
+  }
+}
+
 async function withSession(action: (session: Session) => void): Promise<void> {
   const fileFsPath = activeFilePath();
 
@@ -199,8 +282,7 @@ async function withSession(action: (session: Session) => void): Promise<void> {
 
   action(session);
 
-  await showView(session);
-  await updateContext();
+  await renderSession(session);
 }
 
 async function goPrevious(): Promise<void> {
@@ -215,10 +297,96 @@ async function goPrevious(): Promise<void> {
   });
 }
 
-async function goCurrent(): Promise<void> {
-  await withSession((session) => {
-    session.position = 0;
+interface HistoryItem extends vscode.QuickPickItem {
+  position: number;
+  /** Full SHA for the copy action; undefined for the working-file row. */
+  sha?: string;
+}
+
+const copyButton: vscode.QuickInputButton = {
+  iconPath: new vscode.ThemeIcon('copy'),
+  tooltip: 'Copy full SHA',
+};
+
+function buildHistoryItems(session: Session): HistoryItem[] {
+  const items: HistoryItem[] = [];
+  const mark = (position: number) => (position === session.position ? '$(check) ' : '');
+
+  items.push({
+    label: `${mark(0)}$(file) Working file`,
+    description: session.dirty ? 'uncommitted changes' : 'identical to HEAD',
+    detail: session.head ? `HEAD → ${session.head.sha}` : undefined,
+    position: 0,
   });
+
+  session.timeline.forEach((commit, i) => {
+    const position = i + 1;
+    const behind = commitsBehindHead(session, position);
+    const rel = behind === 0 ? 'HEAD' : `HEAD~${behind}`;
+    const parent = session.timeline[i + 1];
+    const parentPart = parent ? `parent ${parent.sha.slice(0, 7)}` : 'root commit';
+    items.push({
+      label: `${mark(position)}${commit.subject}`,
+      description: `${commit.author} · ${commit.date}`,
+      detail: `${commit.sha}  ·  ${rel}  ·  ${parentPart}`,
+      position,
+      sha: commit.sha,
+      buttons: [copyButton],
+    });
+  });
+
+  return items;
+}
+
+async function showHistory(): Promise<void> {
+  const fileFsPath = activeFilePath();
+
+  if (!fileFsPath) {
+    return;
+  }
+
+  const session = await ensureSession(fileFsPath);
+
+  if (!session) {
+    void vscode.window.showInformationMessage('Git Time Machine: this file is not in a Git repository.');
+    return;
+  }
+
+  if (session.timeline.length === 0) {
+    void vscode.window.showInformationMessage('Git Time Machine: no history for this file yet.');
+    return;
+  }
+
+  const qp = vscode.window.createQuickPick<HistoryItem>();
+  const strip = timelineStrip(session);
+  qp.title = `Git Time Machine — ${positionLabel(session)}${strip ? `   ${strip}` : ''}`;
+  qp.placeholder = 'Select a revision to open it · use the copy icon to copy its full SHA';
+  qp.matchOnDescription = true;
+  qp.matchOnDetail = true;
+
+  const items = buildHistoryItems(session);
+  qp.items = items;
+  qp.activeItems = items.filter((item) => item.position === session.position);
+
+  qp.onDidTriggerItemButton(async (event) => {
+    if (event.item.sha) {
+      await vscode.env.clipboard.writeText(event.item.sha);
+      void vscode.window.showInformationMessage(`Copied ${event.item.sha}`);
+    }
+  });
+
+  qp.onDidAccept(async () => {
+    const pick = qp.selectedItems[0];
+    qp.hide();
+    if (pick && pick.position !== session.position) {
+      session.position = pick.position;
+      await showView(session);
+      await updateContext();
+    }
+  });
+
+  qp.onDidHide(() => qp.dispose());
+  qp.show();
 }
 
 async function goNext(): Promise<void> {
@@ -236,10 +404,14 @@ export function activate(context: vscode.ExtensionContext): void {
     lastFileFsPath = initial.document.uri.fsPath;
   }
 
+  statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
+  statusBarItem.command = 'gtm.current';
+
   context.subscriptions.push(
+    statusBarItem,
     vscode.workspace.registerTextDocumentContentProvider(SCHEME, new RevisionContentProvider()),
     vscode.commands.registerCommand('gtm.prev', goPrevious),
-    vscode.commands.registerCommand('gtm.current', goCurrent),
+    vscode.commands.registerCommand('gtm.current', showHistory),
     vscode.commands.registerCommand('gtm.next', goNext),
     vscode.window.onDidChangeActiveTextEditor((editor) => {
       if (editor?.document.uri.scheme === 'file') {
@@ -247,7 +419,28 @@ export function activate(context: vscode.ExtensionContext): void {
       }
       void updateContext();
     }),
-    vscode.window.tabGroups.onDidChangeTabs(() => void updateContext()),
+    vscode.window.tabGroups.onDidChangeTabs((event) => {
+      // Closing a revision diff ends that time-travel session: rewind to the
+      // working file so the next `Previous` starts one commit back, not from
+      // wherever the closed diff had wandered to. Skip while we're navigating,
+      // since stepping to a new revision replaces (closes) the previous diff.
+      if (!navigating) {
+        for (const tab of event.closed) {
+          const input = tab.input;
+          if (
+            input instanceof vscode.TabInputTextDiff &&
+            input.original.scheme === SCHEME &&
+            input.modified.scheme === 'file'
+          ) {
+            const session = sessions.get(input.modified.fsPath);
+            if (session) {
+              session.position = 0;
+            }
+          }
+        }
+      }
+      void updateContext();
+    }),
     vscode.workspace.onDidSaveTextDocument((doc) => {
       // History may have changed; drop the cached session so it reloads on next use.
       sessions.delete(doc.uri.fsPath);
