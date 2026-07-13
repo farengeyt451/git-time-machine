@@ -380,8 +380,7 @@ async function showHistory(): Promise<void> {
     qp.hide();
     if (pick && pick.position !== session.position) {
       session.position = pick.position;
-      await showView(session);
-      await updateContext();
+      await renderSession(session);
     }
   });
 
