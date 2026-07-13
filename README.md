@@ -15,7 +15,7 @@
 
 ## See it in action
 
-![Git Time Machine demo]((https://raw.githubusercontent.com/farengeyt451/git-time-machine/master/images/demo/demo.gif))
+![Git Time Machine demo](https://raw.githubusercontent.com/farengeyt451/git-time-machine/master/images/demo/demo.gif)
 
 ## Why Git Time Machine?
 
