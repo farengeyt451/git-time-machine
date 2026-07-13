@@ -33,8 +33,8 @@
         "command": "gtm.current",
         "title": "Git Time Machine: Show Position in History",
         "icon": {
-          "light": "images/gtm-cat-light.svg",
-          "dark": "images/gtm-cat-dark.svg"
+          "light": "images/gtm-icon-light.svg",
+          "dark": "images/gtm-icon-dark.svg"
         },
         "enablement": "gtm:enabled"
       },
