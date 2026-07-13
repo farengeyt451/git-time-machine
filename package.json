@@ -1,15 +1,29 @@
 {
-  "name": "gtm-f541",
-  "displayName": "git-time-machine",
-  "description": "Step through a file's Git history with prev / current / next buttons.",
+  "name": "git-time-machine",
+  "displayName": "Git Time Machine",
+  "description": "Travel through any file's Git history - step backward and forward through commits and diff each revision against your working copy.",
   "version": "1.0.3",
   "publisher": "farengeyt451",
   "icon": "images/icon.png",
   "license": "MIT",
+  "homepage": "https://github.com/farengeyt451/git-time-machine#readme",
+  "bugs": {
+    "url": "https://github.com/farengeyt451/git-time-machine/issues"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/farengeyt451/git-time-machine.git"
   },
+  "keywords": [
+    "git",
+    "history",
+    "diff",
+    "blame",
+    "time machine",
+    "revision",
+    "log",
+    "compare"
+  ],
   "engines": {
     "vscode": "^1.125.0"
   },
